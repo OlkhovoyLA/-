@@ -1,0 +1,233 @@
+#include <iarduino_4LED.h>                                  //  подключаем библиотеку для работы с четырёхразрядным LED индикатором
+#include <Ethernet.h>
+#include <SPI.h
+
+//********аппаратная часть********
+iarduino_4LED  dispLED(2,3);                                //  объявляем объект для работы с функциями библиотеки iarduino_4LED, с указанием выводов индикатора ( CLK , DIO ) 
+const uint8_t  pinSensor   = A0;                            //  объявляем константу с указанием номера аналогового входа, к которому подключен датчик влажности почвы
+const uint8_t  pinButtonA  = 12;                            //  объявляем константу с указанием номера вывода, к которому подключена кнопка A
+const uint8_t  pinButtonB  = 11;                            //  объявляем константу с указанием номера вывода, к которому подключена кнопка B
+const uint8_t  pinPump     = 10;   /* вывод с ШИМ  */       //  объявляем константу с указанием номера вывода, к которому подключен силовой ключ
+      uint8_t  btnState;                                    //  объявляем переменную для хранения состояний кнопок: 0-не нажаты, 1-нажата A, 2-нажата B, 3-нажата A и B, 4-удерживается A, 5-удерживается B, 6-удерживались A и B
+      uint16_t arrMoisture[10];                             //  объявляем массив для хранения 10 последних значений влажности почвы
+      uint32_t valMoisture;                                 //  объявляем переменную для расчёта среднего значения влажности почвы
+      uint32_t timWatering;                                 //  объявляем переменную для хранения времени начала последнего полива           (в миллисекундах)
+      uint32_t timSketch;                                   //  объявляем переменную для хранения времени прошедшего с момента старта скетча (в миллисекундах)
+const uint8_t  timWaiting  = 60;                            //  объявляем константу для хранения времени ожидания после полива               (в секундах)     от 0 до 99
+const uint8_t  pwmPump     = 100;                           //  объявляем константу для хранения скорости вращения мотора насоса             (коэффициент)    от 0 до 255
+      uint16_t timDuration = 5;    /* по умолчанию */       //  объявляем переменную для хранения длительности полива                        (в секундах)     от 0 до 99
+      uint16_t limMoisture = 200;    /* по умолчанию */       //  объявляем переменную для хранения пороговой влажности почвы                  (для вкл насоса) от 0 до 999
+      uint8_t  modState    = 0;    /* при старте   */       //  объявляем переменную для хранения состояния устройства: 0-не активно, 1-ожидание, 2-активно, 3-полив, 4-установка пороговой влажности, 5-установка времени полива
+
+//**********серверная часть*******
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(92,62,51,21);
+
+EthernetServer server(80);
+const char str1[] PROGMEM = "<!DOCTYPE html>"; 
+const char str2[] PROGMEM = " »;
+const char str12[] PROGMEM = " ";
+
+const char* const string_table[] PROGMEM = {str1, str2, str3, str4, str5, str6, str7};
+const char* const string_table2[] PROGMEM = {str8, str9, str10, str11, str12};
+char myChar;
+char buffer[80]; 
+
+unsigned long previousMillis1 = 0;// посл момент времени
+unsigned long previousMillis2 = 1;// посл момент времени
+unsigned long previousMillis3 = 1;// посл момент времени
+
+long OnTime2 = 60000; // минута
+long OnTime3 = 1800000; // полчаса
+int In_sec = 0; // отсчет за сек
+int In_min = 0; // отсчет за мин
+int In_half = 0; // отсчет за полчаса
+
+long Sum_min = 0; // сумма за мин
+long Sum_half = 0; // сумма за полчаса
+float Sum_base_min = 0;
+float Sum_base_half = 0;
+int i,j,k =0;
+
+void setup(){
+  //********Аппаратная часть:********
+  dispLED.begin();                                          //  инициируем LED индикатор
+  pinMode(pinButtonA, INPUT);                               //  переводим вывод pinButtonA в режим входа
+  pinMode(pinButtonB, INPUT);                               //  переводим вывод pinButtonB в режим входа
+  pinMode(pinPump,   OUTPUT);                               //  переводим вывод pinPump    в режим выхода
+  digitalWrite(pinPump, LOW);                               //  выключаем насос
+  timWatering = 0;                                          //  сбрасываем время начала последнего полива
+
+
+//**********Серверная часть*******
+
+// start the Ethernet connection and the server:
+Ethernet.begin(mac, ip);
+server.begin();
+}
+void loop(){
+//*******Чтение данных:*******
+  btnState    = Func_buttons_control();                     // читаем состояние кнопок, но не дольше 2 секунд
+  timSketch   = millis();                                   // читаем текущее время с момента старта скетча
+  if(timWatering>timSketch){timWatering=0;}                 // обнуляем время начала последнего полива, если произошло переполнение millis()
+  valMoisture = 0; for(int m=0; m<9; m++){arrMoisture[m]=arrMoisture[m+1];} arrMoisture[9]=analogRead(pinSensor); for(int m=0; m<10; m++){valMoisture+=arrMoisture[m];} valMoisture/=10; // вычисляем среднее значение влажности почвы
+//*******Управление устройством:*******
+  switch(modState){
+//  Устройство не активно
+    case 0: if(btnState){                                   // если зафиксировано нажатие или удержание кнопок
+              if(btnState==6){modState=4;}
+              if(btnState==3){modState=2; limMoisture=valMoisture;}
+            }
+            if(timSketch%100==0){                           // если начинается десятая доля секунды
+              if(timSketch/1000%2){dispLED.print(valMoisture);}else{dispLED.print("    ");}
+            }
+    break;
+//  Устройство в режиме ожидания (после полива)
+    case 1: if(btnState){                                   // если зафиксировано нажатие или удержание кнопок
+              if(btnState==6){modState=4;}
+              if(btnState==1){modState=2;}
+              if(btnState==2){modState=2;}
+              if(btnState==3){modState=2;}
+            } 
+            if(timSketch%100==0){                           // если начинается десятая доля секунды
+              dispLED.print("stop");
+              dispLED.point((timSketch/100%4)+1,true);
+            }
+            if(timDuration+timWaiting-((timSketch-timWatering)/1000)<=0){// если закончилось время ожидания
+              modState=2;
+            }
+    break;
+//  Устройство активно
+    case 2: if(btnState){                                   // если зафиксировано нажатие или удержание кнопок
+              if(btnState==6){modState=4; dispLED.light(7);}
+            }
+            if(timSketch%100==0){                           // если начинается десятая доля секунды
+              if(timSketch/1000%15<5 ){dispLED.light(7); dispLED.print(valMoisture);}else
+              if(timSketch/1000%15<10){dispLED.light(1); dispLED.print(limMoisture,LEN4);}else
+                                      {dispLED.light(7); if(timWatering){dispLED.print(int((timSketch-timWatering)/1000%3600/60),int((timSketch-timWatering)/1000%3600%60),TIME);}else{dispLED.print("----");}}
+            }
+            if(valMoisture<=limMoisture){                    // если текущая влажность почвы меньше пороговой
+              timWatering=timSketch; modState=3; dispLED.light(7); analogWrite(pinPump,pwmPump);
+            }
+    break;
+//  Устройство в режиме полива
+    case 3: if(btnState){                                   // если зафиксировано нажатие или удержание кнопок
+              if(btnState==6){modState=4;}else{modState=1;} analogWrite(pinPump,0);
+            }
+            if(timSketch%100==0){                           // если начинается десятая доля секунды
+              dispLED.print(timDuration-((timSketch-timWatering)/1000));
+              dispLED.point(0,true);
+              dispLED.point((timSketch/100%4)+1,true);
+            }
+            if(timDuration-((timSketch-timWatering)/1000)<=0){// если закончилось время полива
+              modState=1; analogWrite(pinPump,0);
+            }
+    break;
+//  Устройство в режиме установки пороговой влажности почвы
+    case 4: if(btnState){                                   // если зафиксировано нажатие или удержание кнопок
+              if(btnState==6){modState=5;}
+              if(btnState==1){if(limMoisture>0  ){limMoisture--;}}
+              if(btnState==2){if(limMoisture<999){limMoisture++;}}
+              if(btnState==3){limMoisture=valMoisture;}
+              if(btnState==4){while(digitalRead(pinButtonA)){if(limMoisture>0  ){limMoisture--;} delay(100); dispLED.print(limMoisture);}}
+              if(btnState==5){while(digitalRead(pinButtonB)){if(limMoisture<999){limMoisture++;} delay(100); dispLED.print(limMoisture);}}
+            }
+            if(timSketch%100==0){                           // если начинается десятая доля секунды
+              dispLED.print(limMoisture);
+            }
+    break;
+//  Устройство в режиме установки длительность полива
+    case 5: if(btnState){                                   // если зафиксировано нажатие или удержание кнопок
+              if(btnState==6){modState=2;}
+              if(btnState==1){if(timDuration>0 ){timDuration--;}}
+              if(btnState==2){if(timDuration<99){timDuration++;}}
+              if(btnState==4){while(digitalRead(pinButtonA)){if(timDuration>0 ){timDuration--;} delay(100); dispLED.print(timDuration);}}
+              if(btnState==5){while(digitalRead(pinButtonB)){if(timDuration<99){timDuration++;} delay(100); dispLED.print(timDuration);}}
+            }
+            if(timSketch%100==0){                           // если начинается десятая доля секунды
+              dispLED.print(timDuration); dispLED.point(0,true);
+            }
+    break;
+  }
+{
+unsigned long currentMillis = millis();// тек время в мс 
+{
+In_sec = analogRead(pinSensor); 
+Sum_min = Sum_min + (currentMillis — previousMillis1) * In_sec;
+In_min = (Sum_min + Sum_base_min ) / (OnTime2 * i + currentMillis — previousMillis2);
+Sum_half = Sum_half + (currentMillis — previousMillis1) * In_sec;
+In_half = (Sum_half + Sum_base_half) / (OnTime3 * j + currentMillis — previousMillis3);
+previousMillis1 = currentMillis; // запоминаем момент времени
+
+if(currentMillis — previousMillis2 >= OnTime2)
+{ i=1;
+Sum_base_min = Sum_min;
+previousMillis2 = currentMillis; // запоминаем момент времени
+Sum_min = 0;
+} 
+if(currentMillis — previousMillis3 >= OnTime3)
+{ j=1;
+Sum_base_half = Sum_half;
+previousMillis3 = currentMillis; // запоминаем момент времени
+Sum_half = 0;
+} 
+
+EthernetClient client = server.available();
+if (client) {
+boolean currentLineIsBlank = true;
+while (client.connected()) {
+if (client.available()) {
+char c = client.read();
+if (c == '\n' && currentLineIsBlank) {
+for (int i = 0; i < 7; i++)
+{
+strcpy_P(buffer, (char*)pgm_read_word(&(string_table[i]))); 
+client.print(buffer);
+delay( 500 );
+} 
+client.print("['Ввод 1', ");
+client.print(In_sec);
+client.print(", ");
+client.print(In_min);
+client.print(", ");
+client.print(In_half);
+client.print( "],]);");
+
+for (int i = 0; i < 5; i++)
+{
+strcpy_P(buffer, (char*)pgm_read_word(&(string_table2[i]))); 
+client.print(buffer);
+delay( 500 );
+}
+break;
+}
+if (c == '\n') {
+}
+else if (c != '\r') {
+
+}
+}
+}
+delay(1);
+client.stop();
+}
+}
+
+}
+
+// Функция определения состояния кнопок
+uint8_t Func_buttons_control(){
+  uint8_t a=0, b=0;                                         // время удержания кнопок A и B (в десятых долях секунды)
+  while(digitalRead(pinButtonA)||digitalRead(pinButtonB)){  // если нажата кнопка A и/или кнопка B, то создаём цикл, пока они нажаты
+     if(digitalRead(pinButtonA)){if(a<200){a++;}}           // если удерживается кнопка A, то увеличиваем время её удержания
+     if(digitalRead(pinButtonB)){if(b<200){b++;}}           // если удерживается кнопка B, то увеличиваем время её удержания
+     if(a>20 && b>20){dispLED.print("----");}               // если обе кнопки удерживаются дольше 2 секунд, выводим на экран прочерки, указывая что их пора отпустить
+     if(a>20 && b==0){return 4;}                            // если кнопка A   удерживается дольше 2 секунд, возвращаем 4
+     if(a==0 && b>20){return 5;}                            // если кнопка B   удерживается дольше 2 секунд, возвращаем 3
+     delay(100);                                            // задержка на 0,1 секунды, для подавления дребезга
+  }  if(a>20 && b>20){return 6;}                            // если обе кнопки удерживались дольше 2 секунд, возвращаем 6
+     if(a> 0 && b> 0){return 3;}else                        // если обе кнопки удерживалась меньше 2 секунд, возвращаем 5
+     if(a> 0 && b==0){return 1;}else                        // если кнопка A   удерживалась меньше 2 секунд, возвращаем 2
+     if(a==0 && b> 0){return 2;}else                        // если кнопка B   удерживалась меньше 2 секунд, возвращаем 1
+                     {return 0;}                            // если ни одна из кнопок не была нажата,        возвращаем 0
+}
